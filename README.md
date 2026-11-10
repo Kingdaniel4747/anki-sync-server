@@ -31,7 +31,22 @@ Im Tab **Backups** kannst du eine Sicherung sofort anstoßen, herunterladen oder
 
 ## 3. Über GitHub veröffentlichen und auf dem Server ziehen
 
-Erstelle nach deinem Test ein GitHub-Repository und pushe den **Inhalt dieses Projektordners** einschließlich **.github** dorthin. GitHub Actions baut das Image bei einem Push auf den Standardbranch und veröffentlicht es als **ghcr.io/dein-name/dein-repo:latest** für **amd64** und **arm64**. Tags wie **v1.0.0** erhalten ein gleichnamiges Image-Tag. Für Pull Requests wird das Image nur gebaut. Die Aktion verwendet den integrierten GitHub-Token.
+Der Projektordner ist ein eigenständiges lokales Git-Repository. Nach deinem Test erstellst du auf GitHub ein **neues, leeres Repository unter deinem eigenen Konto**. Lass die Optionen für README, Lizenz und .gitignore beim Erstellen leer. Die Dateien sind bereits im Projekt vorhanden.
+
+Führe im Projektordner diese Befehle aus und ersetze DEIN-NAME und DEIN-REPO durch die Angaben deines neuen Repositorys.
+
+~~~powershell
+git add .
+git status --short
+git commit -m "Erste Docker-Version"
+git remote add origin https://github.com/DEIN-NAME/DEIN-REPO.git
+git remote -v
+git push -u origin main
+~~~
+
+Prüfe vor dem Commit die Dateiliste und vor dem Push die Adresse von origin. [GitHub-Anleitung für ein neues Repository aus lokalem Code](https://docs.github.com/en/migrations/importing-source-code/using-the-command-line-to-import-source-code/adding-locally-hosted-code-to-github)
+
+GitHub Actions baut das Image beim Push auf den Standardbranch deines Repositorys und veröffentlicht es als **ghcr.io/dein-name/dein-repo:latest** für **amd64** und **arm64**. Tags wie **v1.0.0** erhalten ein gleichnamiges Image-Tag. Für Pull Requests wird das Image nur gebaut. Die Aktion verwendet den integrierten GitHub-Token.
 
 Stelle das Container-Paket nach dem ersten erfolgreichen Lauf in den GitHub-Paketeinstellungen auf **Public**, wenn der Server es ohne Anmeldung ziehen soll. Lege auf dem Server die **docker-compose.yml** und daneben eine **.env** mit deinem Image-Namen ab.
 
