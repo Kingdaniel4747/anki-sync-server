@@ -187,6 +187,12 @@ def register(app):
         if request.endpoint != "static_assets":
             response.headers["Cache-Control"] = "no-store"
             response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+            )
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 

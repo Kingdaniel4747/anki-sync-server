@@ -107,8 +107,8 @@ def initial_admin(state):
         raise ValueError("Set DASHBOARD_AUTH=username:password in Docker before starting with a new config volume.")
     if not valid_admin_sync_username(username):
         raise ValueError("Choose an administrator name that can also be used as an Anki sync username.")
-    if len(password) > 256:
-        raise ValueError("The administrator password may contain at most 256 characters.")
+    if not 12 <= len(password) <= 256:
+        raise ValueError("Use an administrator password with 12 to 256 characters.")
     state["admin"] = {"username": username, "hash": generate_password_hash(password)}
     set_admin_sync_password(state, password)
 

@@ -10,21 +10,30 @@ set -e
 # -----------------------------------------------------------------------------
 PUID=${PUID:-1000}
 PGID=${PGID:-1000}
+for value in "$PUID" "$PGID"; do
+    if ! [[ "$value" =~ ^[1-9][0-9]{0,9}$ ]] || (( value > 2147483647 )); then
+        echo "PUID and PGID must be positive numeric IDs." >&2
+        exit 1
+    fi
+done
 
-if [ "$PUID" != "1000" ] || [ "$PGID" != "1000" ]; then
-    groupmod -o -g "$PGID" anki 2>/dev/null || true
-    usermod -o -u "$PUID" anki 2>/dev/null || true
+if [ "$PGID" != "1000" ]; then
+    groupmod -o -g "$PGID" anki
+fi
+if [ "$PUID" != "1000" ]; then
+    usermod -o -u "$PUID" anki
 fi
 
-# Fix ownership of volumes created by older root-running releases
-for dir in /data /backups /config /var/log/anki /var/lib/anki; do
-    if [ -d "$dir" ] && [ "$(stat -c %u "$dir")" != "$(id -u anki)" ]; then
-        chown -R anki:anki "$dir" 2>/dev/null || true
+# Data and configuration are local. Leave the external backup share's ACLs alone.
+for dir in /data /config /var/log/anki /var/lib/anki; do
+    if [ "$(stat -c '%u:%g' "$dir")" != "$PUID:$PGID" ]; then
+        chown -hR "$PUID:$PGID" "$dir"
     fi
 done
 
 run_as_anki() {
-    exec setpriv --reuid anki --regid anki --init-groups "$@"
+    umask 077
+    exec setpriv --reuid anki --regid anki --init-groups --no-new-privs "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -42,15 +51,6 @@ if [ "$PASSWORDS_HASHED" = "true" ] || [ "$PASSWORDS_HASHED" = "1" ]; then
 else
     unset PASSWORDS_HASHED
 fi
-
-# TLS settings
-export TLS_ENABLED="${TLS_ENABLED:-false}"
-export TLS_PORT="${TLS_PORT:-8443}"
-export TLS_DOMAIN="${TLS_DOMAIN:-}"
-export DASHBOARD_TLS_DOMAIN="${DASHBOARD_TLS_DOMAIN:-}"
-export TLS_EMAIL="${TLS_EMAIL:-}"
-export TLS_CERT="${TLS_CERT:-}"
-export TLS_KEY="${TLS_KEY:-}"
 
 # Dashboard settings
 export DASHBOARD_PORT="${DASHBOARD_PORT:-8081}"
@@ -95,7 +95,7 @@ shutdown_handler() {
     # bash 5.2 kills the shell mid-handler under set -e (fixed in 5.3)
     set +e
     log_info "Received shutdown signal, stopping gracefully..."
-    for pid in "$SYNC_PID" "$BACKUP_PID" "$DASHBOARD_PID" "$CADDY_PID" "$MONITOR_PID"; do
+    for pid in "$SYNC_PID" "$BACKUP_PID" "$DASHBOARD_PID" "$MONITOR_PID"; do
         if [ -n "$pid" ]; then
             kill -TERM "$pid" 2>/dev/null
         fi
@@ -144,6 +144,10 @@ load_secret "DASHBOARD_AUTH"
 # Import legacy configuration once, after reading Docker secrets.
 export BACKUP_DIR="${BACKUP_DIR:-/backups}"
 export LOG_DIR="/var/log/anki"
+(run_as_anki sh -c 'test -w "$SYNC_BASE" && test -w /config') || {
+    log_error "Anki data and config directories must be writable by PUID:PGID=$PUID:$PGID"
+    exit 1
+}
 (run_as_anki python3 /usr/local/bin/service.py init)
 
 # The workers read persisted settings instead of inheriting legacy secrets.
@@ -154,115 +158,6 @@ done < <(env | grep -E '^(SYNC_USER[0-9]+(_FILE)?|DASHBOARD_AUTH(_FILE)?|PASSWOR
 [ -f /var/lib/anki/sync_count.txt ] || echo "0" > /var/lib/anki/sync_count.txt
 cp /anki_version.txt /var/lib/anki/version.txt 2>/dev/null || true
 date +%s > /var/lib/anki/start_time.txt
-
-# -----------------------------------------------------------------------------
-# Setup TLS with Caddy
-# -----------------------------------------------------------------------------
-setup_tls() {
-    log_info "Setting up TLS with Caddy..."
-
-    local CADDYFILE="/config/caddy/Caddyfile"
-    mkdir -p /config/caddy
-
-    if [ -n "$TLS_DOMAIN" ]; then
-        log_info "Using Let's Encrypt for $TLS_DOMAIN"
-        {
-            echo "{"
-            echo "    admin off"
-            if [ -n "$TLS_EMAIL" ]; then
-                printf '    email %s\n' "$TLS_EMAIL"
-            fi
-            echo "}"
-        } > "$CADDYFILE"
-        cat >> "$CADDYFILE" << EOF
-
-${TLS_DOMAIN} {
-    reverse_proxy 127.0.0.1:${SYNC_PORT}
-    
-    log {
-        output file /var/log/anki/caddy.log
-        format console
-    }
-}
-EOF
-        if [ -n "$DASHBOARD_TLS_DOMAIN" ]; then
-            cat >> "$CADDYFILE" << EOF
-
-${DASHBOARD_TLS_DOMAIN} {
-    reverse_proxy 127.0.0.1:${DASHBOARD_PORT}
-}
-EOF
-        fi
-    elif [ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ] && [ -f "$TLS_CERT" ] && [ -f "$TLS_KEY" ]; then
-        log_info "Using provided TLS certificates"
-        log_info "Generating Caddyfile for manual certificates"
-        cat > "$CADDYFILE" << EOF
-{
-    admin off
-    auto_https disable_redirects
-}
-
-https://:${TLS_PORT} {
-    tls ${TLS_CERT} ${TLS_KEY}
-
-    reverse_proxy localhost:${SYNC_PORT}
-
-    log {
-        output file /var/log/anki/caddy.log
-        format console
-    }
-}
-EOF
-    else
-        log_info "Using self-signed certificate (set TLS_DOMAIN for Let's Encrypt)"
-        log_info "Generating Caddyfile for self-signed certificate"
-        cat > "$CADDYFILE" << EOF
-{
-    admin off
-    auto_https disable_redirects
-}
-
-https://:${TLS_PORT} {
-    tls internal {
-        on_demand
-    }
-
-    reverse_proxy localhost:${SYNC_PORT}
-
-    log {
-        output file /var/log/anki/caddy.log
-        format console
-    }
-}
-EOF
-    fi
-
-    log_debug "Caddyfile created at $CADDYFILE"
-
-    log_info "Starting Caddy on port $TLS_PORT..."
-    XDG_DATA_HOME=/config/caddy caddy run --config "$CADDYFILE" --adapter caddyfile &
-    CADDY_PID=$!
-
-    sleep 2
-
-    if kill -0 "$CADDY_PID" 2>/dev/null; then
-        log_info "Caddy started successfully (PID: $CADDY_PID)"
-    else
-        log_error "Caddy failed to start"
-        TLS_ENABLED="false"
-    fi
-}
-
-if [ -n "$DASHBOARD_TLS_DOMAIN" ]; then
-    if [ "$TLS_ENABLED" != "true" ] || [ -z "$TLS_DOMAIN" ] || [ "$DASHBOARD_TLS_DOMAIN" = "$TLS_DOMAIN" ]; then
-        log_error "DASHBOARD_TLS_DOMAIN requires TLS_ENABLED=true and a separate TLS_DOMAIN."
-        exit 1
-    fi
-    export DASHBOARD_COOKIE_SECURE=true
-fi
-if [ "$TLS_ENABLED" = "true" ]; then
-    setup_tls
-fi
 
 # -----------------------------------------------------------------------------
 # Start the backup scheduler regardless of the initial backup setting.

@@ -132,16 +132,23 @@ def run_backups():
                     state["next_backup"] = settings.next_backup(state["options"], now)
 
 
-def snapshot(source, destination):
+def snapshot(source, destination, backup_dir=None):
     if not source.is_dir() or destination.is_relative_to(source):
         raise ValueError("The Anki data directory and backup destination must be separate.")
+
+    backup_stat = backup_dir.stat() if backup_dir is not None else None
+    if backup_stat is not None and os.path.samestat(source.stat(), backup_stat):
+        raise ValueError("The backup folder cannot be the Anki data folder.")
 
     def fail_on_walk_error(error):
         raise error
 
     for parent, directories, files in os.walk(source, onerror=fail_on_walk_error):
         root = Path(parent)
-        directories[:] = [name for name in directories if not (root / name).is_symlink()]
+        directories[:] = [
+            name for name in directories if not (root / name).is_symlink()
+            and (backup_stat is None or not os.path.samestat((root / name).stat(), backup_stat))
+        ]
         target = destination / root.relative_to(source)
         target.mkdir(parents=True, exist_ok=True)
         for name in files:

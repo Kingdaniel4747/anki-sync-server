@@ -31,8 +31,7 @@ RUN set -eu; \
     chmod +x /usr/local/bin/tailwindcss; \
     mkdir /assets; \
     curl -fsSL https://cdn.jsdelivr.net/npm/chart.js@4.6.1/dist/chart.umd.js -o /assets/chart.umd.js; \
-    echo "338399fb5bafe598d21cfc471b0590b61ceb321a985fade4f68499b151f67fbf  /assets/chart.umd.js" | sha256sum -c -; \
-    curl -fsSL https://raw.githubusercontent.com/caddyserver/caddy/v2.11.9/LICENSE -o /caddy-LICENSE
+    echo "338399fb5bafe598d21cfc471b0590b61ceb321a985fade4f68499b151f67fbf  /assets/chart.umd.js" | sha256sum -c -
 COPY dashboard.css ./
 COPY scripts/dashboard.py ./scripts/
 COPY scripts/templates/ ./scripts/templates/
@@ -41,20 +40,18 @@ RUN tailwindcss -i dashboard.css -o /assets/dashboard.css --minify
 # Runtime shares the builder's Debian and glibc generation.
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates wget bash tzdata sqlite3 \
+    ca-certificates wget bash tzdata \
     python3 python3-pip pigz util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --break-system-packages --no-cache-dir \
     'Flask==3.1.3' 'Werkzeug==3.1.9' 'croniter==7.0.0' 'waitress==3.0.2'
 
-COPY --from=caddy:2.11.9-alpine /usr/bin/caddy /usr/bin/caddy
-COPY --from=dashboard-assets /caddy-LICENSE /usr/local/share/licenses/caddy/LICENSE
 COPY --from=dashboard-assets /assets/ /usr/local/share/anki-dashboard/
 
 # Create user and directories
 RUN useradd -m -s /bin/bash -u 1000 anki \
-    && mkdir -p /var/log/anki /var/lib/anki /data /backups /config /config/caddy \
+    && mkdir -p /var/log/anki /var/lib/anki /data /backups /config \
     && touch /var/log/anki/sync.log /var/log/anki/auth.log /var/log/anki/backup.log /var/log/anki/server.log \
     && chown -R anki:anki /var/log/anki /var/lib/anki /data /backups /config /home/anki
 
@@ -69,8 +66,7 @@ COPY healthcheck.sh /usr/local/bin/
 COPY backup.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/*.sh /usr/local/bin/*.py 2>/dev/null || true
 
-# Anki, dashboard and optional TLS
-EXPOSE 8080 8081 80 443 8443
+EXPOSE 8080 8081
 
 VOLUME ["/data", "/backups", "/config"]
 

@@ -10,6 +10,7 @@ import subprocess
 import time
 import sqlite3
 from datetime import datetime, timedelta
+from stat import S_ISREG
 from pathlib import Path
 
 from flask import Flask, render_template_string, jsonify, request, send_from_directory
@@ -26,6 +27,7 @@ DATA_DIR = os.environ.get('SYNC_BASE', '/data')
 BACKUP_DIR = os.environ.get('BACKUP_DIR', '/backups')
 LOG_DIR = os.environ.get('LOG_DIR', '/var/log/anki')
 STATE_DIR = os.environ.get('STATE_DIR', '/var/lib/anki')
+BACKUP_NAME = re.compile(r'(?:anki_backup|pre_restore)_[0-9]{8}_[0-9]{6}(?:_[0-9]{9})?\.tar\.gz')
 
 _dir_size_cache = {}
 
@@ -238,66 +240,35 @@ def get_storage_breakdown():
         'total_formatted': format_bytes(collections_size + media_size + backups_size + logs_size)
     }
 
-def get_container_info():
-    """Get Docker container information"""
-    info = {
-        'container_id': 'N/A',
-        'image_name': 'anki-sync-server',
-        'restarts': 0,
-        'os': 'unknown',
-        'kernel': 'unknown'
-    }
+def backup_stat(path):
+    if not BACKUP_NAME.fullmatch(path.name):
+        return None
+    try:
+        stat = path.lstat()
+    except OSError:
+        return None
+    return stat if S_ISREG(stat.st_mode) else None
 
-    try:
-        with open('/etc/os-release') as f:
-            for line in f:
-                if line.startswith('PRETTY_NAME='):
-                    info['os'] = line.split('=', 1)[1].strip().strip('"')
-                    break
-    except Exception:
-        pass
-    try:
-        u = os.uname()
-        info['kernel'] = f"{u.sysname} {u.release} ({u.machine})"
-    except Exception:
-        pass
-    
-    try:
-        with open('/proc/self/cgroup', 'r') as f:
-            for line in f:
-                if 'docker' in line or 'containerd' in line:
-                    parts = line.strip().split('/')
-                    if parts:
-                        cid = parts[-1]
-                        if len(cid) >= 12:
-                            info['container_id'] = cid[:12]
-                    break
-    except Exception:
-        pass
-    
-    if info['container_id'] == 'N/A':
-        try:
-            info['container_id'] = os.environ.get('HOSTNAME', 'unknown')[:12]
-        except Exception:
-            pass
-    
-    return info
+
+def backup_entries():
+    return [
+        (path, stat) for path in Path(BACKUP_DIR).glob('*.tar.gz')
+        if (stat := backup_stat(path)) is not None
+    ]
+
 
 def get_backups():
-    backups = []
-    if os.path.exists(BACKUP_DIR):
-        files = sorted(Path(BACKUP_DIR).glob('*.tar.gz'),
-                       key=lambda f: f.stat().st_mtime, reverse=True)
-        for f in files[:20]:
-            stat = f.stat()
-            backups.append({
-                'name': f.name,
-                'kind': 'safety' if f.name.startswith('pre_restore_') else 'scheduled',
-                'size': stat.st_size,
-                'size_formatted': format_bytes(stat.st_size),
-                'created': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
-            })
-    return backups
+    entries = sorted(backup_entries(), key=lambda entry: entry[1].st_mtime, reverse=True)
+    return [
+        {
+            'name': path.name,
+            'kind': 'safety' if path.name.startswith('pre_restore_') else 'scheduled',
+            'size': stat.st_size,
+            'size_formatted': format_bytes(stat.st_size),
+            'created': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
+        }
+        for path, stat in entries[:20]
+    ]
 
 def get_auth_stats():
     lines = read_log_lines(os.path.join(LOG_DIR, 'auth.log'), 1000)
@@ -316,29 +287,6 @@ def get_sync_chart_data():
                 daily[date] += 1
     data = sorted(daily.items())
     return {'labels': [d[0] for d in data], 'values': [d[1] for d in data]}
-
-def get_system_stats():
-    stats = {'disk_total': 0, 'disk_used': 0, 'disk_percent': 0,
-             'memory_total': 0, 'memory_used': 0, 'memory_percent': 0, 'load_avg': [0, 0, 0]}
-    try:
-        st = os.statvfs(DATA_DIR)
-        stats['disk_total'] = st.f_frsize * st.f_blocks
-        stats['disk_used'] = stats['disk_total'] - st.f_frsize * st.f_bavail
-        stats['disk_percent'] = (stats['disk_used'] / stats['disk_total'] * 100) if stats['disk_total'] else 0
-    except Exception: pass
-    try:
-        with open('/proc/meminfo') as f:
-            mem = {l.split()[0].rstrip(':'): int(l.split()[1]) * 1024 for l in f if len(l.split()) >= 2}
-        stats['memory_total'] = mem.get('MemTotal', 0)
-        stats['memory_used'] = stats['memory_total'] - mem.get('MemAvailable', mem.get('MemFree', 0))
-        stats['memory_percent'] = (stats['memory_used'] / stats['memory_total'] * 100) if stats['memory_total'] else 0
-    except Exception: pass
-    try:
-        with open('/proc/loadavg') as f:
-            p = f.read().split()
-            stats['load_avg'] = [float(p[0]), float(p[1]), float(p[2])]
-    except Exception: pass
-    return stats
 
 def get_recent_syncs():
     lines = read_log_lines(os.path.join(LOG_DIR, 'sync.log'), 200)
@@ -367,7 +315,7 @@ def api_stats():
     start_time = float(read_file_safe(os.path.join(STATE_DIR, 'start_time.txt'), str(time.time())))
     users = get_users()
     auth = get_auth_stats()
-    backup_count = len(list(Path(BACKUP_DIR).glob('*.tar.gz'))) if os.path.exists(BACKUP_DIR) else 0
+    backup_count = len(backup_entries())
     return jsonify({
         'version': read_file_safe(os.path.join(STATE_DIR, 'version.txt'), 'Unknown'),
         'uptime_formatted': format_duration(time.time() - start_time),
@@ -386,10 +334,6 @@ def api_users():
 @app.route('/api/storage')
 def api_storage():
     return jsonify(get_storage_breakdown())
-
-@app.route('/api/container')
-def api_container():
-    return jsonify(get_container_info())
 
 @app.route('/api/backups')
 def api_backups():
@@ -410,22 +354,22 @@ def api_create_backup():
 
 @app.route('/api/backups/download/<filename>')
 def api_download_backup(filename):
-    if filename != os.path.basename(filename) or not filename.endswith('.tar.gz'):
-        return jsonify({'error': 'Invalid filename'}), 400
-    try:
-        return send_from_directory(BACKUP_DIR, filename, as_attachment=True)
-    except FileNotFoundError:
-        return jsonify({'error': 'File not found'}), 404
+    if Path(filename).name != filename or backup_stat(Path(BACKUP_DIR) / filename) is None:
+        return jsonify(error='Backup not found'), 404
+    return send_from_directory(BACKUP_DIR, filename, as_attachment=True)
+
 
 @app.route('/api/backups/delete/<filename>', methods=['POST'])
 def api_delete_backup(filename):
-    if filename != os.path.basename(filename) or not filename.endswith('.tar.gz'):
-        return jsonify({'error': 'Invalid filename'}), 400
-    filepath = os.path.join(BACKUP_DIR, filename)
-    if not os.path.exists(filepath):
-        return jsonify({'error': 'File not found'}), 404
-    os.remove(filepath)
-    return jsonify({'success': True})
+    path = Path(BACKUP_DIR) / filename
+    if path.name != filename or backup_stat(path) is None:
+        return jsonify(error='Backup not found'), 404
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return jsonify(error='Backup not found'), 404
+    return jsonify(success=True)
+
 
 _update_cache = {'ts': 0.0, 'latest': ''}
 
@@ -458,7 +402,8 @@ def api_logs(log_type):
     files = {'sync': 'sync.log', 'auth': 'auth.log', 'backup': 'backup.log', 'server': 'server.log'}
     if log_type not in files:
         return jsonify({'error': 'Invalid'}), 400
-    return jsonify({'lines': read_log_lines(os.path.join(LOG_DIR, files[log_type]), int(request.args.get('lines', 100)))})
+    lines = request.args.get('lines', 100, type=int)
+    return jsonify(lines=read_log_lines(os.path.join(LOG_DIR, files[log_type]), min(1000, max(1, lines))))
 
 @app.route('/api/chart')
 def api_chart():
@@ -467,19 +412,6 @@ def api_chart():
 @app.route('/api/latency')
 def api_latency():
     return jsonify(get_latency_stats())
-
-@app.route('/api/system')
-def api_system():
-    s = get_system_stats()
-    return jsonify({**s, 'disk_used_formatted': format_bytes(s['disk_used']), 'disk_total_formatted': format_bytes(s['disk_total']),
-                    'memory_used_formatted': format_bytes(s['memory_used']), 'memory_total_formatted': format_bytes(s['memory_total'])})
-
-@app.route('/api/features')
-def api_features():
-    return jsonify({
-        "TLS": os.environ.get("TLS_ENABLED", "false") == "true",
-        "Automatic backups": settings.read()["options"]["BACKUP_ENABLED"] == "true",
-    })
 
 @app.route('/api/syncs')
 def api_syncs():
@@ -542,8 +474,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-4" id="storage-legend"></div>
             </div>
             
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
-                <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Features</div><div id="features" class="space-y-2"></div></div>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
                 <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Backups</div><div class="text-4xl font-bold text-slate-300" id="backups">--</div><div class="text-sm text-slate-500 mt-1" id="backups-size">--</div></div>
                 <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Auth Stats</div><div class="space-y-1 mt-2"><div>Success: <span class="text-green-400 font-semibold" id="auth-ok">0</span></div><div>Failed: <span class="text-red-400 font-semibold" id="auth-fail">0</span></div></div></div>
             </div>
@@ -701,11 +632,6 @@ async function refreshAll(){
         document.getElementById('storage-bar').innerHTML=Object.entries(storageColors).map(([k,c])=>`<div style="width:${((d[k]||0)/total)*100}%;background:${c}" title="${k}: ${d[k+'_formatted']}"></div>`).join('');
         document.getElementById('storage-legend').innerHTML=Object.entries(storageColors).map(([k,c])=>`<div class="flex items-center gap-2"><span class="w-3 h-3 rounded" style="background:${c}"></span><span class="text-sm text-slate-500">${k.charAt(0).toUpperCase()+k.slice(1)}</span><span class="text-sm font-medium ml-auto">${d[k+'_formatted']}</span></div>`).join('');
         document.getElementById('backups-size').textContent=d.backups_formatted+' total';
-    }catch(e){}
-    
-    try{
-        const r=await fetch('/api/features');const d=await r.json();
-        document.getElementById('features').innerHTML=Object.entries(d).map(([k,v])=>`<div class="flex justify-between"><span>${k}</span><span class="px-2 py-0.5 rounded-full text-xs font-semibold ${v?'bg-green-500/20 text-green-400':'bg-slate-700 text-slate-500'}">${v?'ON':'OFF'}</span></div>`).join('');
     }catch(e){}
     
     try{
