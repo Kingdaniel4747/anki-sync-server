@@ -1,5 +1,6 @@
 """Internal workers for synchronization and backups."""
 
+import fcntl
 import os
 import re
 import shutil
@@ -18,6 +19,9 @@ STATE_DIR = Path(os.environ.get("STATE_DIR", "/var/lib/anki"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", "/var/log/anki"))
 BIN_DIR = Path(__file__).resolve().parent
 STOP = Event()
+BACKUP_REQUEST = "backup-request.lock"
+SYNC_ACTIVE = "sync-active.lock"
+SYNC_DRAIN_TIMEOUT = 60
 
 
 def shutdown(*_args):
@@ -35,35 +39,68 @@ def stop_child(child, sig=signal.SIGTERM, timeout=8):
         child.wait()
 
 
+def try_lock(file):
+    try:
+        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
 def run_sync():
-    active = None
+    with (STATE_DIR / BACKUP_REQUEST).open("a+b") as request, (STATE_DIR / SYNC_ACTIVE).open("a+b") as active:
+        supervise_sync(request, active)
+
+
+def supervise_sync(request, active):
+    users = None
     child = None
+    draining = False
     try:
         while not STOP.is_set():
-            users = settings.read()["users"]
-            if active != users:
+            pause_requested = not try_lock(request)
+            if not pause_requested:
+                fcntl.flock(request, fcntl.LOCK_UN)
+
+            if child is not None and child.poll() is not None:
+                fcntl.flock(active, fcntl.LOCK_UN)
+                child = None
+                if not draining and not pause_requested:
+                    print("Sync process exited. Retrying shortly.", flush=True)
+                    STOP.wait(3)
+                draining = False
+
+            if pause_requested and child is not None and not draining:
+                # Anki drains HTTP requests on SIGINT and then closes SQLite.
+                child.send_signal(signal.SIGINT)
+                draining = True
+            if pause_requested or draining:
+                STOP.wait(0.25)
+                continue
+
+            configured = settings.read()["users"]
+            if users != configured:
                 if child is not None:
                     stop_child(child, signal.SIGINT)
-                active = users
+                    fcntl.flock(active, fcntl.LOCK_UN)
+                    child = None
+                users = configured
                 idle = STATE_DIR / "sync-idle"
                 if users:
                     idle.unlink(missing_ok=True)
                 else:
                     idle.touch()
 
-            if users and (child is None or child.poll() is not None):
+            if users and child is None and try_lock(active):
                 env = {key: value for key, value in os.environ.items()
                        if not re.fullmatch(r"SYNC_USER[0-9]+", key)}
                 env["PASSWORDS_HASHED"] = "1"
                 for index, (name, password) in enumerate(users.items(), start=1):
                     env[f"SYNC_USER{index}"] = f"{name}:{password}"
-                child = subprocess.Popen(["anki-sync-server"], env=env)
+                # Keep the lock even if the supervisor exits before Anki does.
+                child = subprocess.Popen(["anki-sync-server"], env=env, pass_fds=(active.fileno(),))
 
-            if STOP.wait(2):
-                break
-            if child is not None and child.poll() is not None and users:
-                print("Sync process exited. Retrying shortly.", flush=True)
-                STOP.wait(3)
+            STOP.wait(1)
     finally:
         if child is not None:
             stop_child(child, signal.SIGINT)
@@ -132,6 +169,25 @@ def run_backups():
                     state["next_backup"] = settings.next_backup(state["options"], now)
 
 
+def snapshot_with_sync_paused(source, destination, backup_dir):
+    print("Waiting for Anki Sync to release the database locks.", flush=True)
+    deadline = time.monotonic() + SYNC_DRAIN_TIMEOUT
+    # The request makes the supervisor drain Anki. The active lock guarantees
+    # that Anki has exited before we read any data and cannot reopen it mid-copy.
+    with (STATE_DIR / BACKUP_REQUEST).open("a+b") as request, (STATE_DIR / SYNC_ACTIVE).open("a+b") as active:
+        for lock in (request, active):
+            while not try_lock(lock):
+                if STOP.wait(0.25):
+                    raise InterruptedError("Backup interrupted by container shutdown.")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Anki Sync is still finishing an active request. Try again later.")
+        if STOP.is_set():
+            raise InterruptedError("Backup interrupted by container shutdown.")
+        print("Copying Anki collections and media.", flush=True)
+        snapshot(source, destination, backup_dir)
+    print("Local snapshot complete. Sync can resume while the archive is being written.", flush=True)
+
+
 def snapshot(source, destination, backup_dir=None):
     if not source.is_dir() or destination.is_relative_to(source):
         raise ValueError("The Anki data directory and backup destination must be separate.")
@@ -152,6 +208,8 @@ def snapshot(source, destination, backup_dir=None):
         target = destination / root.relative_to(source)
         target.mkdir(parents=True, exist_ok=True)
         for name in files:
+            if STOP.is_set():
+                raise InterruptedError("Backup interrupted by container shutdown.")
             path = root / name
             if path.is_symlink() or not path.is_file() or name.endswith(("-wal", "-shm", "-journal")):
                 continue
@@ -159,6 +217,8 @@ def snapshot(source, destination, backup_dir=None):
                 deadline = time.monotonic() + 60
 
                 def check_deadline(_status, _remaining, _total):
+                    if STOP.is_set():
+                        raise InterruptedError("Backup interrupted by container shutdown.")
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"SQLite snapshot timed out for {path.name}")
 
@@ -181,7 +241,10 @@ def main():
     elif command == "backups":
         run_backups()
     elif command == "snapshot":
-        snapshot(*(Path(arg).resolve() for arg in args))
+        try:
+            snapshot_with_sync_paused(*(Path(arg).resolve() for arg in args))
+        except (OSError, ValueError, sqlite3.Error) as error:
+            sys.exit(f"Backup snapshot failed: {error}")
     elif command == "with-settings":
         script, *arguments = args
         env = managed_environment(settings.read()["options"])
