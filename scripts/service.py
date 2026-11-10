@@ -1,23 +1,16 @@
-"""Internal workers for synchronization, backups and notifications."""
+"""Internal workers for synchronization and backups."""
 
-import json
 import os
 import re
 import shutil
 import signal
-import smtplib
 import sqlite3
-import ssl
 import subprocess
 import sys
 import time
 from contextlib import closing
-from datetime import datetime
-from email.message import EmailMessage
 from pathlib import Path
 from threading import Event
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 import settings
 
@@ -52,10 +45,6 @@ def run_sync():
                 if child is not None:
                     stop_child(child, signal.SIGINT)
                 active = users
-                # Keep the existing metrics reader and external health check usable.
-                names = STATE_DIR / "users.txt.tmp"
-                names.write_text("".join(name + "\n" for name in users), encoding="utf-8")
-                names.replace(STATE_DIR / "users.txt")
                 idle = STATE_DIR / "sync-idle"
                 if users:
                     idle.unlink(missing_ok=True)
@@ -173,85 +162,19 @@ def snapshot(source, destination):
                 shutil.copy2(path, target / name)
 
 
-def send_webhook(options, message, title):
-    kind = options["NOTIFY_TYPE"]
-    text = f"{title}: {message}"
-    payload = {
-        "discord": {"content": text},
-        "telegram": {"text": text},
-        "slack": {"text": text},
-        "ntfy": {"title": title, "message": message},
-        "generic": {"title": title, "message": message},
-    }[kind]
-    url = options["NOTIFY_WEBHOOK_URL"]
-    if kind == "telegram":
-        data, headers = urlencode({"text": text}).encode(), {"Content-Type": "application/x-www-form-urlencoded"}
-    elif kind == "ntfy":
-        data, headers = message.encode(), {"Title": title}
-    else:
-        data, headers = json.dumps(payload).encode(), {"Content-Type": "application/json"}
-    with urlopen(Request(url, data=data, headers=headers, method="POST"), timeout=10):
-        pass
-
-
-def send_email(options, message, title):
-    mail = EmailMessage()
-    mail["Subject"] = title
-    mail["From"] = options["EMAIL_FROM"]
-    mail["To"] = options["EMAIL_TO"]
-    mail.set_content(message)
-    context = ssl.create_default_context()
-    mode = options["EMAIL_TLS"]
-    args = (options["EMAIL_HOST"], int(options["EMAIL_PORT"]))
-    connection = (smtplib.SMTP_SSL(*args, timeout=10, context=context) if mode == "implicit"
-                  else smtplib.SMTP(*args, timeout=10))
-    with connection as smtp:
-        if mode == "on":
-            smtp.starttls(context=context)
-        if options["EMAIL_USER"]:
-            smtp.login(options["EMAIL_USER"], options["EMAIL_PASS"])
-        smtp.send_message(mail)
-
-
-def notify(options, message, title):
-    outcomes = []
-    for flag, name, send in (
-        ("NOTIFY_ENABLED", "Webhook", send_webhook),
-        ("EMAIL_ENABLED", "Email", send_email),
-    ):
-        if options[flag] != "true":
-            continue
-        try:
-            send(options, message, title)
-            outcomes.append((True, f"{name} sent."))
-        except (OSError, ValueError, KeyError) as error:
-            # Transport exceptions can include credentials or secret endpoint paths.
-            outcomes.append((False, f"{name} failed ({type(error).__name__})."))
-    if not outcomes:
-        return False, "Enable a webhook or email first."
-    return all(ok for ok, _ in outcomes), " ".join(detail for _, detail in outcomes)
-
-
 def main():
     command, *args = sys.argv[1:]
     if command == "init":
-        settings.initialize()
-        state = settings.read()
-        if state["setup_token"] and os.environ.get("DASHBOARD_ENABLED", "true") == "true":
-            print("Dashboard one-time setup token:", state["setup_token"], flush=True)
-        if not state["users"] and os.environ.get("DASHBOARD_ENABLED", "true") != "true":
-            sys.exit("Enable the dashboard for setup or provide an initial SYNC_USER1.")
+        try:
+            settings.initialize()
+        except ValueError as error:
+            sys.exit(str(error))
     elif command == "sync":
         run_sync()
     elif command == "backups":
         run_backups()
     elif command == "snapshot":
         snapshot(*(Path(arg).resolve() for arg in args))
-    elif command == "notify":
-        message, title = args
-        ok, detail = notify(settings.read()["options"], message, title)
-        print(detail)
-        return 0 if ok else 1
     elif command == "with-settings":
         script, *arguments = args
         env = managed_environment(settings.read()["options"])

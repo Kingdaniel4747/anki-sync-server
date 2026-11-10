@@ -10,11 +10,10 @@ import sqlite3
 from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
-from werkzeug.security import generate_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 DIRECTORY = Path(os.environ.get("CONFIG_DIR", "/config")) / "management"
 DATABASE = DIRECTORY / "settings.sqlite3"
@@ -24,30 +23,6 @@ OPTIONS = {
     "BACKUP_SCHEDULE": ("Schedule (five cron fields)", "text", "0 3 * * *"),
     "BACKUP_TIMEZONE": ("Backup time zone (IANA)", "text", "UTC"),
     "BACKUP_RETENTION_DAYS": ("Retention (days)", "number", "7"),
-    "S3_BACKUP_ENABLED": ("Upload to S3", "bool", "false"),
-    "S3_ENDPOINT": ("Custom S3 endpoint", "url", ""),
-    "S3_BUCKET": ("Bucket", "text", ""),
-    "S3_REGION": ("Region", "text", "us-east-1"),
-    "S3_ACCESS_KEY": ("Access key", "secret", ""),
-    "S3_SECRET_KEY": ("Secret key", "secret", ""),
-    "NOTIFY_ENABLED": ("Send webhook notifications", "bool", "false"),
-    "NOTIFY_TYPE": ("Webhook type", "select", "discord"),
-    "NOTIFY_WEBHOOK_URL": ("Webhook URL", "secret", ""),
-    "EMAIL_ENABLED": ("Send email notifications", "bool", "false"),
-    "EMAIL_HOST": ("SMTP host", "text", ""),
-    "EMAIL_PORT": ("SMTP port", "number", "587"),
-    "EMAIL_USER": ("SMTP username", "text", ""),
-    "EMAIL_PASS": ("SMTP password", "secret", ""),
-    "EMAIL_FROM": ("From address", "text", ""),
-    "EMAIL_TO": ("To address", "text", ""),
-    "EMAIL_TLS": ("SMTP security", "select", "on"),
-}
-CHOICES = {
-    "NOTIFY_TYPE": {
-        "discord": "Discord", "telegram": "Telegram", "slack": "Slack",
-        "ntfy": "ntfy", "generic": "Generic JSON",
-    },
-    "EMAIL_TLS": {"on": "STARTTLS", "implicit": "TLS", "off": "Unencrypted"},
 }
 SCHEDULE_FIELDS = ("BACKUP_ENABLED", "BACKUP_SCHEDULE", "BACKUP_TIMEZONE")
 
@@ -91,12 +66,9 @@ def validate_options(options):
     for key, value in options.items():
         if len(value) > 4096 or any(char in value for char in "\r\n\0"):
             raise ValueError(f"Invalid value for {OPTIONS[key][0]}.")
-        if key in CHOICES and value not in CHOICES[key]:
-            raise ValueError(f"Invalid choice for {OPTIONS[key][0]}.")
-    for key, minimum, maximum in (("BACKUP_RETENTION_DAYS", 1, 36500), ("EMAIL_PORT", 1, 65535)):
-        value = options[key]
-        if not re.fullmatch(r"[0-9]{1,5}", value) or not minimum <= int(value) <= maximum:
-            raise ValueError(f"{OPTIONS[key][0]} must be between {minimum} and {maximum}.")
+    retention = options["BACKUP_RETENTION_DAYS"]
+    if not re.fullmatch(r"[0-9]{1,5}", retention) or not 1 <= int(retention) <= 36500:
+        raise ValueError("Retention must be between 1 and 36500 days.")
     try:
         ZoneInfo(options["BACKUP_TIMEZONE"])
     except (ZoneInfoNotFoundError, ValueError):
@@ -109,18 +81,36 @@ def validate_options(options):
     except ValueError:
         raise ValueError("The schedule has no upcoming run.") from None
 
-    for key in ("S3_ENDPOINT", "NOTIFY_WEBHOOK_URL"):
-        if options[key]:
-            url = urlsplit(options[key])
-            if url.scheme not in {"http", "https"} or not url.hostname:
-                raise ValueError(f"{OPTIONS[key][0]} must be an HTTP(S) URL.")
-    for toggle, required in (
-        ("S3_BACKUP_ENABLED", ("S3_BUCKET", "S3_ACCESS_KEY", "S3_SECRET_KEY")),
-        ("NOTIFY_ENABLED", ("NOTIFY_WEBHOOK_URL",)),
-        ("EMAIL_ENABLED", ("EMAIL_HOST", "EMAIL_FROM", "EMAIL_TO")),
-    ):
-        if options[toggle] == "true" and any(not options[key] for key in required):
-            raise ValueError(f"Fill in the connection details before enabling {OPTIONS[toggle][0].lower()}.")
+
+def valid_admin_sync_username(username):
+    # The upstream server uses this name as a single directory within /data.
+    return (
+        bool(username) and username == username.strip()
+        and username not in {".", ".."}
+        and len(username.encode()) <= 255
+        and not any(char in username for char in "/\\:\0\r\n")
+    )
+
+
+def set_admin_sync_password(state, password):
+    admin = state["admin"]
+    username = admin["username"]
+    # Older dashboards could accept names that cannot be used for sync.
+    if valid_admin_sync_username(username):
+        state["users"][username] = password_hash(password)
+        admin["sync_enabled"] = True
+
+
+def initial_admin(state):
+    username, separator, password = os.environ.get("DASHBOARD_AUTH", "").partition(":")
+    if not separator or not username or not password:
+        raise ValueError("Set DASHBOARD_AUTH=username:password in Docker before starting with a new config volume.")
+    if not valid_admin_sync_username(username):
+        raise ValueError("Choose an administrator name that can also be used as an Anki sync username.")
+    if len(password) > 256:
+        raise ValueError("The administrator password may contain at most 256 characters.")
+    state["admin"] = {"username": username, "hash": generate_password_hash(password)}
+    set_admin_sync_password(state, password)
 
 
 def initialize():
@@ -129,7 +119,23 @@ def initialize():
     with closing(sqlite3.connect(DATABASE)) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute("CREATE TABLE IF NOT EXISTS settings (value TEXT NOT NULL)")
-        if connection.execute("SELECT 1 FROM settings").fetchone():
+        row = connection.execute("SELECT value FROM settings").fetchone()
+        if row:
+            state = json.loads(row[0])
+            if not state["admin"]:
+                initial_admin(state)
+            elif not state["admin"].get("sync_enabled"):
+                admin = state["admin"]
+                username, _, password = os.environ.get("DASHBOARD_AUTH", "").partition(":")
+                if username == admin["username"] and check_password_hash(admin["hash"], password):
+                    set_admin_sync_password(state, password)
+            state.pop("setup_token", None)
+            state["options"] = {key: state["options"].get(key, default)
+                                for key, (_, _, default) in OPTIONS.items()}
+            updated = json.dumps(state)
+            if updated != row[0]:
+                connection.execute("PRAGMA secure_delete = ON")
+                connection.execute("UPDATE settings SET value = ?", (updated,))
             return
 
         users = {}
@@ -142,14 +148,6 @@ def initialize():
                 raise ValueError(f"Invalid legacy user in {key}.")
             users[username] = password if hashed else password_hash(password)
 
-        admin = None
-        auth = os.environ.get("DASHBOARD_AUTH", "")
-        if auth:
-            username, separator, password = auth.partition(":")
-            if not separator or not username or not password:
-                raise ValueError("DASHBOARD_AUTH must contain username:password.")
-            admin = {"username": username, "hash": generate_password_hash(password)}
-
         options = {key: os.environ.get(key, default) for key, (_, _, default) in OPTIONS.items()}
         options["BACKUP_TIMEZONE"] = os.environ.get("BACKUP_TIMEZONE") or os.environ.get("TZ", "UTC")
         for key, (_, kind, _) in OPTIONS.items():
@@ -157,8 +155,8 @@ def initialize():
                 options[key] = str(options[key].lower() in {"true", "1"}).lower()
 
         state = {
-            "admin": admin, "setup_token": None if admin else secrets.token_urlsafe(24),
             "session_key": secrets.token_hex(32), "users": users, "options": options,
             "next_backup": None, "backup_job": None, "last_backup": None,
         }
+        initial_admin(state)
         connection.execute("INSERT INTO settings VALUES (?)", (json.dumps(state),))

@@ -1,11 +1,10 @@
 *
 !Dockerfile
+!dashboard.css
 !entrypoint.sh
 !healthcheck.sh
 !backup.sh
 !scripts/
 !scripts/**
-!fail2ban/
-!fail2ban/**
 **/__pycache__
 **/*.pyc

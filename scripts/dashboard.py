@@ -15,7 +15,6 @@ from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request, send_from_directory
 
 import management
-import service
 import settings
 
 app = Flask(__name__)
@@ -396,13 +395,18 @@ def api_container():
 def api_backups():
     return jsonify(get_backups())
 
+@app.route('/api/backups/status')
+def api_backup_status():
+    return jsonify(management.backup_status(settings.read()))
+
+
 @app.route('/api/backups/create', methods=['POST'])
 def api_create_backup():
     with settings.edit() as state:
         if state["backup_job"] is not None:
             return jsonify(success=False, message="A backup is already queued or running."), 409
         state["backup_job"] = "manual"
-    return jsonify(success=True, message="Backup queued. See Settings for the result."), 202
+    return jsonify(success=True, message="Backup queued."), 202
 
 @app.route('/api/backups/download/<filename>')
 def api_download_backup(filename):
@@ -449,11 +453,6 @@ def api_update():
 def static_assets(filename):
     return send_from_directory(STATIC_DIR, filename)
 
-@app.route('/api/notify/test', methods=['POST'])
-def api_test_notify():
-    ok, detail = service.notify(settings.read()["options"], "Test notification from Anki Dashboard", "Anki Sync Server")
-    return jsonify(success=ok, message=detail)
-
 @app.route('/api/logs/<log_type>')
 def api_logs(log_type):
     files = {'sync': 'sync.log', 'auth': 'auth.log', 'backup': 'backup.log', 'server': 'server.log'}
@@ -477,13 +476,10 @@ def api_system():
 
 @app.route('/api/features')
 def api_features():
-    options = {**os.environ, **settings.read()["options"]}
-    flags = {
-        "TLS": "TLS_ENABLED", "Backups": "BACKUP_ENABLED", "S3 Upload": "S3_BACKUP_ENABLED",
-        "Metrics": "METRICS_ENABLED", "Fail2Ban": "FAIL2BAN_ENABLED",
-        "Notifications": "NOTIFY_ENABLED", "Email": "EMAIL_ENABLED",
-    }
-    return jsonify({label: options.get(key, "false") == "true" for label, key in flags.items()})
+    return jsonify({
+        "TLS": os.environ.get("TLS_ENABLED", "false") == "true",
+        "Automatic backups": settings.read()["options"]["BACKUP_ENABLED"] == "true",
+    })
 
 @app.route('/api/syncs')
 def api_syncs():
@@ -500,7 +496,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Anki Sync Server</title>
-    <script src="/static/tailwind.js"></script>
+    <link rel="stylesheet" href="/static/dashboard.css">
     <script src="/static/chart.umd.js"></script>
 </head>
 <body class="min-h-screen p-6 bg-slate-900 text-slate-200" id="body">
@@ -511,7 +507,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <a id="update-badge" class="hidden px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-400 hover:bg-amber-500/30" href="https://github.com/ankitects/anki/releases/latest" target="_blank" rel="noopener"></a>
             </div>
             <div class="flex items-center gap-2">
-                <a href="{{ url_for('manage') }}" class="px-3 py-2 rounded-lg bg-slate-800 text-cyan-300">Settings</a>
                 <form action="{{ url_for('logout') }}" method="post">
                     <input type="hidden" name="csrf" value="{{ csrf_token() }}">
                     <button class="px-3 py-2 rounded-lg bg-slate-800">Sign out</button>
@@ -520,16 +515,20 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             </div>
         </div>
         
-        <div class="flex gap-2 mb-6 flex-wrap" id="tabs">
-            <button onclick="showTab('overview')" class="tab-btn px-4 py-2 rounded-lg bg-blue-600 text-white">Overview</button>
-            <button onclick="showTab('users')" class="tab-btn px-4 py-2 rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700">Users</button>
-            <button onclick="showTab('backups')" class="tab-btn px-4 py-2 rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700">Backups</button>
-            <button onclick="showTab('logs')" class="tab-btn px-4 py-2 rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700">Logs</button>
-            <button onclick="showTab('system')" class="tab-btn px-4 py-2 rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700">System</button>
-        </div>
+        <nav class="flex gap-2 mb-6 flex-wrap" id="tabs" aria-label="Dashboard">
+            {% for tab in tabs %}
+            <a href="{{ url_for('dashboard', tab=tab) }}" data-tab="{{ tab }}"
+               {% if tab == active_tab %}aria-current="page"{% endif %}
+               class="tab-btn px-4 py-2 rounded-lg {{ 'bg-blue-600 text-white' if tab == active_tab else 'bg-slate-800 text-slate-400 hover:bg-slate-700' }}">{{ tab | title }}</a>
+            {% endfor %}
+        </nav>
+        {% for category, message in get_flashed_messages(with_categories=true) %}
+        <p role="{{ 'alert' if category == 'error' else 'status' }}"
+           class="mb-4 p-3 rounded-lg text-sm {{ 'bg-red-900 text-white' if category == 'error' else 'bg-green-900 text-white' }}">{{ message }}</p>
+        {% endfor %}
 
         <!-- Overview -->
-        <div id="tab-overview" class="tab-content">
+        <div id="tab-overview" class="tab-content{{ ' hidden' if active_tab != 'overview' }}">
             <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
                 <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Server Status</div><div class="flex items-center gap-2 mb-1"><span class="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse"></span><span class="text-lg text-green-400">Online</span></div><div class="text-sm text-slate-500">Version: <span id="version">--</span></div><div class="text-sm text-slate-500">Uptime: <span id="uptime">--</span></div></div>
                 <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-2">Users</div><div class="text-4xl font-bold text-green-400" id="users">--</div><div class="text-sm text-slate-500 mt-1">Active users</div></div>
@@ -546,7 +545,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
                 <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Features</div><div id="features" class="space-y-2"></div></div>
                 <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Backups</div><div class="text-4xl font-bold text-slate-300" id="backups">--</div><div class="text-sm text-slate-500 mt-1" id="backups-size">--</div></div>
-                <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Auth Stats</div><div class="space-y-1 mt-2"><div>Success: <span class="text-green-400 font-semibold" id="auth-ok">0</span></div><div>Failed: <span class="text-red-400 font-semibold" id="auth-fail">0</span></div></div><button id="notify-btn" onclick="testNotify()" class="mt-4 w-full px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm transition text-white disabled:opacity-40 disabled:cursor-not-allowed">Test Notification</button></div>
+                <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Auth Stats</div><div class="space-y-1 mt-2"><div>Success: <span class="text-green-400 font-semibold" id="auth-ok">0</span></div><div>Failed: <span class="text-red-400 font-semibold" id="auth-fail">0</span></div></div></div>
             </div>
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
                 <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Sync Activity (7 Days)</div><canvas id="chart" height="180"></canvas></div>
@@ -554,26 +553,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Users -->
-        <div id="tab-users" class="tab-content hidden">
-            <div class="card bg-slate-800 rounded-xl p-5">
-                <div class="flex justify-between mb-4"><span class="text-xs text-slate-500 uppercase">User Statistics</span><button onclick="loadUsers()" class="px-4 py-1.5 bg-blue-600 rounded-lg text-sm hover:bg-blue-700 text-white">Refresh</button></div>
-                <div id="user-storage-chart" class="bg-slate-700/50 rounded-lg p-4 mb-4"></div>
-                <div id="users-list" class="space-y-2"></div>
-            </div>
+        <div id="tab-users" class="tab-content{{ ' hidden' if active_tab != 'users' }}">
+            {% include "users_panel.html" %}
         </div>
 
-        <!-- Backups -->
-        <div id="tab-backups" class="tab-content hidden">
-            <div class="card bg-slate-800 rounded-xl p-5">
-                <div class="flex justify-between mb-4"><span class="text-xs text-slate-500 uppercase">Backup Files</span><button id="bkbtn" onclick="createBackup()" class="px-4 py-1.5 bg-green-600 rounded-lg text-sm hover:bg-green-700 text-white">Create Backup</button></div>
-                <div id="bkalert" class="hidden mb-4 p-3 rounded-lg text-sm"></div>
-                <table class="w-full"><thead><tr class="text-left text-slate-500 text-xs border-b border-slate-700"><th class="pb-2">Filename</th><th class="pb-2">Size</th><th class="pb-2">Created</th><th class="pb-2 text-right">Actions</th></tr></thead><tbody id="bktbl"></tbody></table>
-            </div>
+        <div id="tab-backups" class="tab-content{{ ' hidden' if active_tab != 'backups' }}">
+            {% include "backups_panel.html" %}
         </div>
 
         <!-- Logs -->
-        <div id="tab-logs" class="tab-content hidden">
+        <div id="tab-logs" class="tab-content{{ ' hidden' if active_tab != 'logs' }}">
             <div class="card bg-slate-800 rounded-xl p-5">
                 <div class="flex justify-between mb-4 flex-wrap gap-2">
                     <div class="flex gap-2"><button onclick="loadLogs('sync')" class="logbtn px-4 py-1.5 bg-blue-600 rounded-lg text-sm text-white">Sync</button><button onclick="loadLogs('auth')" class="logbtn px-4 py-1.5 bg-slate-700 rounded-lg text-sm hover:bg-slate-600 text-slate-300">Auth</button><button onclick="loadLogs('backup')" class="logbtn px-4 py-1.5 bg-slate-700 rounded-lg text-sm hover:bg-slate-600 text-slate-300">Backup</button><button onclick="loadLogs('server')" class="logbtn px-4 py-1.5 bg-slate-700 rounded-lg text-sm hover:bg-slate-600 text-slate-300">Server</button></div>
@@ -587,31 +576,54 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- System -->
-        <div id="tab-system" class="tab-content hidden">
-            <div class="card bg-slate-800 rounded-xl p-5 mb-4">
-                <div class="text-xs text-slate-500 uppercase tracking-wider mb-4">Docker Container</div>
-                <div class="grid grid-cols-2 md:grid-cols-3 gap-4" id="container-info"></div>
-            </div>
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase mb-3">Disk Usage</div><div class="flex justify-between text-sm mb-2"><span id="du">--</span><span id="dt">--</span></div><div class="h-2 bg-slate-700 rounded-full overflow-hidden"><div id="dp" class="h-full bg-blue-500 rounded-full" style="width:0"></div></div><div class="text-sm text-slate-500 mt-1"><span id="dpc">0</span>% used</div></div>
-                <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase mb-3">Memory Usage</div><div class="flex justify-between text-sm mb-2"><span id="mu">--</span><span id="mt">--</span></div><div class="h-2 bg-slate-700 rounded-full overflow-hidden"><div id="mp" class="h-full bg-green-500 rounded-full" style="width:0"></div></div><div class="text-sm text-slate-500 mt-1"><span id="mpc">0</span>% used</div></div>
-                <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase mb-3">Load Average</div><div class="grid grid-cols-3 gap-4 text-center mt-2"><div><div class="text-2xl font-bold text-blue-400" id="l1">--</div><div class="text-xs text-slate-500">1m</div></div><div><div class="text-2xl font-bold text-blue-400" id="l5">--</div><div class="text-xs text-slate-500">5m</div></div><div><div class="text-2xl font-bold text-blue-400" id="l15">--</div><div class="text-xs text-slate-500">15m</div></div></div></div>
-                <div class="card bg-slate-800 rounded-xl p-5"><div class="text-xs text-slate-500 uppercase mb-3">Server Info</div><div class="space-y-2 text-sm"><div class="flex justify-between"><span class="text-slate-500">Version:</span><span id="sv">--</span></div><div class="flex justify-between"><span class="text-slate-500">Users:</span><span id="su">--</span></div><div class="flex justify-between"><span class="text-slate-500">Backups:</span><span id="sb">--</span></div></div></div>
-            </div>
-        </div>
-
         <footer class="text-center text-slate-600 text-sm mt-8">Anki Sync Server Enhanced | Auto-refresh: <span id="cd">10</span>s</footer>
     </div>
 <script>
 const csrfToken = {{ csrf_token() | tojson }};
-let logType='sync',chart,cd=10,darkMode=true,expandedUser=null;
+let logType='sync',chart,cd=10,darkMode=true;
+let activeTab = {{ active_tab | tojson }};
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function rel(epoch){const d=Date.now()/1000-epoch;if(d<60)return Math.max(0,Math.floor(d))+'s ago';if(d<3600)return Math.floor(d/60)+'m ago';if(d<86400)return Math.floor(d/3600)+'h ago';return Math.floor(d/86400)+'d ago';}
 const storageColors={collections:'#06b6d4',media:'#3b82f6',backups:'#a855f7',logs:'#64748b'};
 
-document.addEventListener('DOMContentLoaded',()=>{initChart();if(localStorage.getItem('theme')==='light')toggleTheme();refreshAll();setInterval(()=>{if(document.hidden)return;cd--;document.getElementById('cd').textContent=cd;if(cd<=0){cd=10;refreshAll();}},1000);});
-document.addEventListener('visibilitychange',()=>{if(!document.hidden){cd=10;refreshAll();}});
+document.addEventListener('DOMContentLoaded', () => {
+    const frequency = document.querySelector('#schedule-kind');
+    function updateScheduleFields() {
+        for (const field of document.querySelectorAll('[data-modes]')) {
+            field.hidden = !field.dataset.modes.split(' ').includes(frequency.value);
+        }
+    }
+    frequency.addEventListener('change', updateScheduleFields);
+    updateScheduleFields();
+
+    for (const tab of document.querySelectorAll('.tab-btn')) {
+        tab.addEventListener('click', event => {
+            if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+            event.preventDefault();
+            showTab(tab.dataset.tab);
+            history.replaceState(null, '', tab.href);
+        });
+    }
+    if (typeof Chart !== 'undefined') initChart();
+    if (localStorage.getItem('theme') === 'light') toggleTheme();
+    showTab(activeTab);
+    refreshAll();
+    setInterval(() => {
+        if (document.hidden) return;
+        document.getElementById('cd').textContent = --cd;
+        if (cd <= 0) {
+            cd = 10;
+            refreshAll();
+            if (activeTab === 'backups') loadBackups();
+        }
+    }, 1000);
+});
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    cd = 10;
+    refreshAll();
+    if (activeTab === 'backups') loadBackups();
+});
 
 function toggleTheme(){
     darkMode=!darkMode;
@@ -632,19 +644,25 @@ function toggleTheme(){
     localStorage.setItem('theme',darkMode?'dark':'light');
 }
 
-function showTab(t){
-    document.querySelectorAll('.tab-content').forEach(e=>e.classList.add('hidden'));
-    document.getElementById('tab-'+t).classList.remove('hidden');
-    document.querySelectorAll('.tab-btn').forEach(b=>{
-        b.classList.remove('bg-blue-600','text-white');
-        b.classList.add(darkMode?'bg-slate-800':'bg-gray-200',darkMode?'text-slate-400':'text-gray-600');
+function showTab(tab) {
+    activeTab = tab;
+    document.querySelectorAll('.tab-content').forEach(panel => {
+        panel.classList.toggle('hidden', panel.id !== 'tab-' + tab);
     });
-    event.target.classList.remove(darkMode?'bg-slate-800':'bg-gray-200',darkMode?'text-slate-400':'text-gray-600');
-    event.target.classList.add('bg-blue-600','text-white');
-    if(t==='users')loadUsers();
-    if(t==='backups')loadBackups();
-    if(t==='logs')loadLogs(logType);
-    if(t==='system')loadSystem();
+    document.querySelectorAll('.tab-btn').forEach(link => {
+        const selected = link.dataset.tab === tab;
+        link.classList.toggle('bg-blue-600', selected);
+        link.classList.toggle('text-white', selected);
+        link.classList.toggle('bg-slate-800', darkMode && !selected);
+        link.classList.toggle('text-slate-400', darkMode && !selected);
+        link.classList.toggle('bg-gray-200', !darkMode && !selected);
+        link.classList.toggle('text-gray-600', !darkMode && !selected);
+        if (selected) link.setAttribute('aria-current', 'page');
+        else link.removeAttribute('aria-current');
+    });
+    if (tab === 'users') loadUsers();
+    if (tab === 'backups') loadBackups();
+    if (tab === 'logs') loadLogs(logType);
 }
 
 function chartTheme(){return darkMode?{grid:'rgba(255,255,255,0.05)',ticks:'#64748b'}:{grid:'rgba(0,0,0,0.07)',ticks:'#6b7280'};}
@@ -675,9 +693,6 @@ async function refreshAll(){
         document.getElementById('backups').textContent=d.backup_count;
         document.getElementById('auth-ok').textContent=d.auth_success;
         document.getElementById('auth-fail').textContent=d.auth_failed;
-        document.getElementById('sv').textContent=d.version;
-        document.getElementById('su').textContent=d.user_count;
-        document.getElementById('sb').textContent=d.backup_count;
     }catch(e){}
     
     try{
@@ -691,8 +706,6 @@ async function refreshAll(){
     try{
         const r=await fetch('/api/features');const d=await r.json();
         document.getElementById('features').innerHTML=Object.entries(d).map(([k,v])=>`<div class="flex justify-between"><span>${k}</span><span class="px-2 py-0.5 rounded-full text-xs font-semibold ${v?'bg-green-500/20 text-green-400':'bg-slate-700 text-slate-500'}">${v?'ON':'OFF'}</span></div>`).join('');
-        const nb=document.getElementById('notify-btn');
-        if(nb){const on=d['Notifications']||d['Email'];nb.disabled=!on;nb.title=on?'':'Set NOTIFY_ENABLED or EMAIL_ENABLED first';}
     }catch(e){}
     
     try{
@@ -720,68 +733,43 @@ async function refreshAll(){
     }catch(e){}
 }
 
-let usersData=[];
-async function loadUsers(){
-    try{
-        const r=await fetch('/api/users');usersData=await r.json();
-        renderUsers();
-    }catch(e){}
+async function loadUsers() {
+    try {
+        const response = await fetch('/api/users');
+        if (!response.ok) return;
+        const users = new Map((await response.json()).map(user => [user.username, user]));
+        for (const row of document.querySelectorAll('[data-sync-user]')) {
+            const user = users.get(row.dataset.syncUser);
+            if (!user) continue;
+            row.querySelector('[data-user-summary]').textContent = user.total_size_formatted + ' · ' + user.last_sync;
+            const collections = user.collections.map(item => {
+                const detail = item.type === 'database'
+                    ? (item.cards == null ? 'card count unavailable' : item.cards.toLocaleString() + ' cards')
+                    : item.files + ' files';
+                return '<li>' + esc(item.name) + ' · ' + esc(item.size_formatted) + ' · ' + esc(detail) + '</li>';
+            });
+            const devices = (user.devices || []).map(device =>
+                '<li>' + esc(device.platform) + ' · Anki ' + esc(device.version) + ' · ' + esc(device.last_seen) + '</li>');
+            row.querySelector('[data-user-details]').innerHTML =
+                (collections.length ? '<p class="font-medium">Collections</p><ul class="mb-3">' + collections.join('') + '</ul>' : '') +
+                (devices.length ? '<p class="font-medium">Devices</p><ul>' + devices.join('') + '</ul>' : '');
+        }
+    } catch (error) {
+        // User forms remain usable when statistics are unavailable.
+    }
 }
-
-function renderUsers(){
-    try{
-        const d=usersData;
-        const totalSize=d.reduce((a,b)=>a+b.total_size,0)||1;
-        
-        document.getElementById('user-storage-chart').innerHTML='<div class="text-xs text-slate-500 uppercase mb-3">Storage per User</div>'+d.map(u=>`<div class="mb-3"><div class="flex justify-between text-sm mb-1"><span class="text-cyan-400 font-medium">${esc(u.username)}</span><span>${u.total_size_formatted}</span></div><div class="h-2 ${darkMode?'bg-slate-600':'bg-gray-300'} rounded-full overflow-hidden"><div class="h-full bg-cyan-500 rounded-full" style="width:${(u.total_size/totalSize)*100}%"></div></div></div>`).join('');
-        
-        document.getElementById('users-list').innerHTML=d.map((u,i)=>`
-            <div class="border ${darkMode?'border-slate-700':'border-gray-200'} rounded-lg overflow-hidden">
-                <div class="flex items-center justify-between p-4 cursor-pointer ${darkMode?'hover:bg-slate-700':'hover:bg-gray-100'}" onclick="toggleUser(${i})">
-                    <div class="flex items-center gap-3">
-                        <span class="transition-transform ${expandedUser===i?'rotate-90':''}" id="arrow-${i}">▶</span>
-                        <span class="text-cyan-400 font-medium">${esc(u.username)}</span>
-                    </div>
-                    <div class="flex gap-6 text-sm">
-                        <span>${u.total_size_formatted}</span>
-                        <span class="text-slate-500">${u.last_sync}</span>
-                    </div>
-                </div>
-                <div id="detail-${i}" class="${expandedUser===i?'':'hidden'} ${darkMode?'bg-slate-700/50':'bg-gray-100'} p-4 border-t ${darkMode?'border-slate-700':'border-gray-200'}">
-                    <div class="text-xs text-slate-500 uppercase mb-3">Collection Details</div>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        ${u.collections.map(c=>`
-                            <div class="${darkMode?'bg-slate-800':'bg-white'} rounded-lg p-3">
-                                <div class="flex justify-between mb-2">
-                                    <span class="font-mono text-sm">${esc(c.name)}</span>
-                                    <span class="text-cyan-400 font-semibold">${c.size_formatted}</span>
-                                </div>
-                                <div class="text-xs text-slate-500">${c.type==='database'?(c.cards!=null?c.cards.toLocaleString()+' cards':'card count unavailable'):c.files+' files'}</div>
-                                <div class="text-xs text-slate-500">Modified: ${c.modified}</div>
-                            </div>
-                        `).join('')}
-                    </div>
-                    ${u.devices&&u.devices.length?`
-                    <div class="text-xs text-slate-500 uppercase mt-4 mb-2">Devices</div>
-                    <div class="space-y-1.5">
-                        ${u.devices.map(dv=>`
-                            <div class="flex justify-between items-center text-sm ${darkMode?'bg-slate-800':'bg-white'} rounded-lg px-3 py-2">
-                                <span>${/android|ios|iphone|ipad/i.test(dv.platform)?'📱':'💻'} ${esc(dv.platform)} · Anki ${esc(dv.version)}</span>
-                                <span class="text-slate-500 text-xs">last seen ${dv.last_seen}</span>
-                            </div>
-                        `).join('')}
-                    </div>`:''}
-                </div>
-            </div>
-        `).join('');
-    }catch(e){}
-}
-
-function toggleUser(i){expandedUser=expandedUser===i?null:i;renderUsers();}
 
 async function loadBackups(){
     try{
-        const r=await fetch('/api/backups');const d=await r.json();
+        const [files, status] = await Promise.all([fetch('/api/backups'), fetch('/api/backups/status')]);
+        if (status.ok) {
+            const state = await status.json();
+            document.getElementById('next-backup').textContent = state.next_run;
+            document.getElementById('last-backup').textContent = state.last_run;
+            document.getElementById('backup-pending').hidden = !state.pending;
+        }
+        if (!files.ok) return;
+        const d = await files.json();
         document.getElementById('bktbl').innerHTML=d.map(b=>`
             <tr class="border-b ${darkMode?'border-slate-700':'border-gray-200'}">
                 <td class="py-3 font-mono text-xs">${esc(b.name)}${b.kind==='safety'?' <span class="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-purple-500/20 text-purple-400">pre-restore</span>':''}</td>
@@ -814,17 +802,9 @@ async function createBackup(){
         al.className='mb-4 p-3 rounded-lg text-sm bg-red-900/50 text-red-400';
         al.textContent='Failed';
     }
-    btn.disabled=false;btn.textContent='Create Backup';
+    btn.disabled=false;btn.textContent='Create backup now';
 }
 
-async function testNotify(){
-    try{
-        const r=await fetch('/api/notify/test',{method:'POST',headers:{'X-CSRF-Token':csrfToken}});const d=await r.json();
-        alert(d.message);
-    }catch(e){alert('Failed to send notification');}
-}
-
-let logLines=[];
 async function loadLogs(t){
     logType=t;
     document.querySelectorAll('.logbtn').forEach(b=>{b.classList.remove('bg-blue-600','text-white');b.classList.add('bg-slate-700','text-slate-300');});
@@ -857,39 +837,17 @@ function renderLogs(){
 
 function refreshLogs(){loadLogs(logType);}
 
-async function loadSystem(){
-    try{
-        const r=await fetch('/api/system');const d=await r.json();
-        document.getElementById('du').textContent=d.disk_used_formatted;
-        document.getElementById('dt').textContent=d.disk_total_formatted;
-        document.getElementById('dp').style.width=d.disk_percent+'%';
-        document.getElementById('dpc').textContent=d.disk_percent.toFixed(1);
-        document.getElementById('mu').textContent=d.memory_used_formatted;
-        document.getElementById('mt').textContent=d.memory_total_formatted;
-        document.getElementById('mp').style.width=d.memory_percent+'%';
-        document.getElementById('mpc').textContent=d.memory_percent.toFixed(1);
-        document.getElementById('l1').textContent=d.load_avg[0].toFixed(2);
-        document.getElementById('l5').textContent=d.load_avg[1].toFixed(2);
-        document.getElementById('l15').textContent=d.load_avg[2].toFixed(2);
-    }catch(e){}
-    
-    try{
-        const r=await fetch('/api/container');const d=await r.json();
-        document.getElementById('container-info').innerHTML=`
-            <div><div class="text-xs text-slate-500">Container ID</div><div class="text-sm font-mono">${d.container_id}</div></div>
-            <div><div class="text-xs text-slate-500">Image</div><div class="text-sm">${d.image_name}</div></div>
-            <div><div class="text-xs text-slate-500">Container OS</div><div class="text-sm">${esc(d.os)}</div></div>
-            <div><div class="text-xs text-slate-500">Host Kernel</div><div class="text-sm">${esc(d.kernel)}</div></div>
-            <div><div class="text-xs text-slate-500">Restarts</div><div class="text-lg font-semibold text-green-400">${d.restarts}</div></div>
-        `;
-    }catch(e){}
-}
 </script>
 </body></html>'''
 
 @app.route('/')
 def dashboard():
-    return render_template_string(DASHBOARD_HTML)
+    tabs = ("overview", "users", "backups", "logs")
+    selected = request.args.get("tab")
+    return render_template_string(
+        DASHBOARD_HTML, tabs=tabs, active_tab=selected if selected in tabs else "overview",
+        **management.dashboard_context(settings.read()),
+    )
 
 management.register(app)
 

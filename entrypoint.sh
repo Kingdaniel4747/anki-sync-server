@@ -52,18 +52,7 @@ export TLS_EMAIL="${TLS_EMAIL:-}"
 export TLS_CERT="${TLS_CERT:-}"
 export TLS_KEY="${TLS_KEY:-}"
 
-# Fail2ban settings
-export FAIL2BAN_ENABLED="${FAIL2BAN_ENABLED:-false}"
-export FAIL2BAN_MAX_RETRIES="${FAIL2BAN_MAX_RETRIES:-5}"
-export FAIL2BAN_BAN_TIME="${FAIL2BAN_BAN_TIME:-3600}"
-export FAIL2BAN_FIND_TIME="${FAIL2BAN_FIND_TIME:-600}"
-
-# Metrics settings
-export METRICS_ENABLED="${METRICS_ENABLED:-false}"
-export METRICS_PORT="${METRICS_PORT:-9090}"
-
 # Dashboard settings
-export DASHBOARD_ENABLED="${DASHBOARD_ENABLED:-true}"
 export DASHBOARD_PORT="${DASHBOARD_PORT:-8081}"
 export DASHBOARD_AUTH="${DASHBOARD_AUTH:-}"
 
@@ -100,19 +89,13 @@ log_warn()  { log warn "$@"; }
 log_error() { log error "$@"; }
 
 # -----------------------------------------------------------------------------
-# Notifications use the current settings from the configuration volume.
-send_notification() {
-    (run_as_anki python3 /usr/local/bin/service.py notify "$@") >/dev/null 2>&1 || true
-}
-
-# -----------------------------------------------------------------------------
 # Graceful shutdown handler
 # -----------------------------------------------------------------------------
 shutdown_handler() {
     # bash 5.2 kills the shell mid-handler under set -e (fixed in 5.3)
     set +e
     log_info "Received shutdown signal, stopping gracefully..."
-    for pid in "$SYNC_PID" "$BACKUP_PID" "$DASHBOARD_PID" "$METRICS_PID" "$CADDY_PID" "$MONITOR_PID"; do
+    for pid in "$SYNC_PID" "$BACKUP_PID" "$DASHBOARD_PID" "$CADDY_PID" "$MONITOR_PID"; do
         if [ -n "$pid" ]; then
             kill -TERM "$pid" 2>/dev/null
         fi
@@ -122,8 +105,6 @@ shutdown_handler() {
             wait "$pid"
         fi
     done
-
-    pkill fail2ban 2>/dev/null || true
 
     log_info "Shutdown complete"
     exit "${1:-0}"
@@ -157,10 +138,6 @@ load_secret() {
     fi
 }
 
-load_secret "NOTIFY_WEBHOOK_URL"
-load_secret "EMAIL_PASS"
-load_secret "S3_ACCESS_KEY"
-load_secret "S3_SECRET_KEY"
 load_secret "DASHBOARD_AUTH"
 
 # -----------------------------------------------------------------------------
@@ -172,10 +149,9 @@ export LOG_DIR="/var/log/anki"
 # The workers read persisted settings instead of inheriting legacy secrets.
 while IFS='=' read -r name _; do
     unset "$name"
-done < <(env | grep -E '^(SYNC_USER[0-9]+(_FILE)?|DASHBOARD_AUTH(_FILE)?|PASSWORDS_HASHED|EMAIL_PASS(_FILE)?|S3_(ACCESS|SECRET)_KEY(_FILE)?|NOTIFY_WEBHOOK_URL(_FILE)?)=')
+done < <(env | grep -E '^(SYNC_USER[0-9]+(_FILE)?|DASHBOARD_AUTH(_FILE)?|PASSWORDS_HASHED)=')
 
 [ -f /var/lib/anki/sync_count.txt ] || echo "0" > /var/lib/anki/sync_count.txt
-[ -f /var/lib/anki/bytes_synced.txt ] || echo "0" > /var/lib/anki/bytes_synced.txt
 cp /anki_version.txt /var/lib/anki/version.txt 2>/dev/null || true
 date +%s > /var/lib/anki/start_time.txt
 
@@ -289,53 +265,13 @@ if [ "$TLS_ENABLED" = "true" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Setup fail2ban
-# -----------------------------------------------------------------------------
-if [ "$FAIL2BAN_ENABLED" = "true" ]; then
-    if command -v fail2ban-server > /dev/null 2>&1; then
-        log_info "Setting up fail2ban (max retries: $FAIL2BAN_MAX_RETRIES, ban time: ${FAIL2BAN_BAN_TIME}s)"
-
-        cat > /etc/fail2ban/jail.d/anki.local << EOF
-[anki-auth]
-enabled = true
-filter = anki-auth
-logpath = /var/log/anki/auth.log
-maxretry = ${FAIL2BAN_MAX_RETRIES}
-bantime = ${FAIL2BAN_BAN_TIME}
-findtime = ${FAIL2BAN_FIND_TIME}
-ignoreip = 127.0.0.1/8 ::1
-action = iptables-allports[name=anki, protocol=all]
-EOF
-
-        if fail2ban-server -b -x > /dev/null 2>&1; then
-            log_info "Fail2ban started"
-        else
-            log_error "Fail2ban failed to start (container may need NET_ADMIN capability)"
-        fi
-    else
-        log_warn "FAIL2BAN_ENABLED=true but fail2ban is not installed in this image"
-    fi
-fi
-
-# -----------------------------------------------------------------------------
 # Start the backup scheduler regardless of the initial backup setting.
 run_as_anki python3 /usr/local/bin/service.py backups &
 BACKUP_PID=$!
 
-if [ "$DASHBOARD_ENABLED" = "true" ]; then
-    log_info "Starting dashboard on port $DASHBOARD_PORT"
-    run_as_anki python3 /usr/local/bin/dashboard.py &
-    DASHBOARD_PID=$!
-fi
-
-# -----------------------------------------------------------------------------
-# Setup metrics endpoint
-# -----------------------------------------------------------------------------
-if [ "$METRICS_ENABLED" = "true" ]; then
-    log_info "Starting metrics server on port $METRICS_PORT"
-    ANKI_VERSION="$ANKI_VERSION" run_as_anki python3 /usr/local/bin/metrics.py &
-    METRICS_PID=$!
-fi
+log_info "Starting dashboard on port $DASHBOARD_PORT"
+run_as_anki python3 /usr/local/bin/dashboard.py &
+DASHBOARD_PID=$!
 
 # -----------------------------------------------------------------------------
 # Monitor sync server output for sync/auth events
@@ -401,9 +337,6 @@ SYNC_PID=$!
 monitor_sync_output /var/log/anki/server.log &
 MONITOR_PID=$!
 
-workers=("$SYNC_PID" "$BACKUP_PID")
-[ -z "$DASHBOARD_PID" ] || workers+=("$DASHBOARD_PID")
-send_notification "Server started" "Anki Sync Server" &
-wait -n "${workers[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+wait -n "$SYNC_PID" "$BACKUP_PID" "$DASHBOARD_PID" && EXIT_CODE=0 || EXIT_CODE=$?
 log_error "A required worker stopped (exit code: $EXIT_CODE)"
 shutdown_handler "$(( EXIT_CODE == 0 ? 1 : EXIT_CODE ))"

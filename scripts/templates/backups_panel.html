@@ -1,0 +1,65 @@
+{% macro field(key) %}
+    {% set label, kind, default = fields[key] %}
+    <label class="text-sm block">
+        {% if kind == "bool" %}
+        <input type="checkbox" name="{{ key }}" class="mr-2" {% if options[key] == "true" %}checked{% endif %}>{{ label }}
+        {% else %}
+        {{ label }}
+        <input name="{{ key }}" type="{{ kind }}" value="{{ options[key] }}"
+               {% if kind == "number" %}min="1" max="36500" required{% endif %}
+               class="block w-full mt-1 px-3 py-2 bg-transparent border border-slate-500 rounded-lg">
+        {% endif %}
+    </label>
+{% endmacro %}
+<section class="card bg-slate-800 rounded-xl p-5 mb-4">
+    <h2 class="text-lg font-semibold mb-2">Backup schedule</h2>
+    <p class="text-sm text-slate-500 mb-1">Next backup <span id="next-backup">{{ next_run }}</span></p>
+    <p class="text-sm text-slate-500 mb-1">Last backup <span id="last-backup">{{ last_run }}</span></p>
+    <p id="backup-pending" class="text-sm text-blue-500 mb-1" {% if not pending %}hidden{% endif %}>Backup queued or running</p>
+    <form method="post" action="{{ url_for('manage') }}" class="mt-4">
+        <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+        <input type="hidden" name="action" value="options">
+        {{ field("BACKUP_ENABLED") }}
+        <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 mt-3">
+            <label class="text-sm">Frequency
+                <select name="schedule_kind" id="schedule-kind"
+                        class="block w-full mt-1 px-3 py-2 bg-transparent border border-slate-500 rounded-lg">
+                    {% for key, label in [("daily", "Daily"), ("weekly", "Weekly"), ("custom", "Custom cron")] %}
+                    <option value="{{ key }}" {% if schedule_kind == key %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label data-modes="daily weekly" class="text-sm">Local time
+                <input type="time" name="backup_time" value="{{ backup_time }}"
+                       class="block w-full mt-1 px-3 py-2 bg-transparent border border-slate-500 rounded-lg">
+            </label>
+            <label data-modes="weekly" class="text-sm">Day
+                <select name="backup_day" class="block w-full mt-1 px-3 py-2 bg-transparent border border-slate-500 rounded-lg">
+                    {% for day in weekdays %}
+                    <option value="{{ loop.index0 }}" {% if backup_day == loop.index0 | string %}selected{% endif %}>{{ day }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <div data-modes="custom">{{ field("BACKUP_SCHEDULE") }}</div>
+            {{ field("BACKUP_TIMEZONE") }}
+            {{ field("BACKUP_RETENTION_DAYS") }}
+        </div>
+        <button class="mt-4 px-4 py-2 rounded-lg bg-blue-600 text-sm text-white">Save backup schedule</button>
+    </form>
+</section>
+<section class="card bg-slate-800 rounded-xl p-5">
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 class="text-lg font-semibold">Backup files</h2>
+        <button id="bkbtn" onclick="createBackup()" class="px-4 py-2 bg-green-700 rounded-lg text-sm text-white">Create backup now</button>
+    </div>
+    <div id="bkalert" class="hidden mb-4 p-3 rounded-lg text-sm" role="status"></div>
+    <div class="overflow-x-auto">
+        <table class="w-full">
+            <thead><tr class="text-left text-slate-500 text-xs border-b border-slate-500/40">
+                <th class="pb-2">Filename</th><th class="pb-2">Size</th>
+                <th class="pb-2">Created</th><th class="pb-2 text-right">Actions</th>
+            </tr></thead>
+            <tbody id="bktbl"></tbody>
+        </table>
+    </div>
+</section>

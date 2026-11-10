@@ -35,7 +35,7 @@ def same_text(first, second):
 
 
 def admin_marker(admin):
-    return hashlib.sha256(admin["hash"].encode()).hexdigest()
+    return hashlib.sha256(("sync-v1:" + admin["hash"]).encode()).hexdigest()
 
 
 def start_session(admin):
@@ -87,11 +87,6 @@ def save_options(form):
             value = form.get(key, "")
             if kind == "bool":
                 options[key] = "true" if value == "on" else "false"
-            elif kind == "secret":
-                if form.get(f"clear_{key}") == "on":
-                    options[key] = ""
-                elif value:
-                    options[key] = value
             else:
                 options[key] = value.strip()
         options["BACKUP_SCHEDULE"] = schedule_from_form(form)
@@ -119,6 +114,39 @@ def display_time(timestamp, zone):
     except (KeyError, ValueError):
         tz = ZoneInfo("UTC")
     return datetime.fromtimestamp(timestamp, tz).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def backup_status(state):
+    zone = state["options"]["BACKUP_TIMEZONE"]
+    last = state["last_backup"]
+    last_run = "—"
+    if last:
+        result = "completed" if last["success"] else "failed, see Backup logs"
+        last_run = f"{display_time(last['time'], zone)} · {result}"
+    return {
+        "next_run": display_time(state["next_backup"], zone) or "—",
+        "last_run": last_run,
+        "pending": bool(state["backup_job"]),
+    }
+
+
+def dashboard_context(state):
+    options = state["options"]
+    kind, backup_time, day = schedule_view(options["BACKUP_SCHEDULE"])
+    admin = state["admin"]
+    username = admin["username"]
+    return {
+        "users": sorted(name for name in state["users"] if name != username),
+        "admin_username": username,
+        "admin_sync_enabled": admin.get("sync_enabled", False),
+        "options": options,
+        "fields": settings.OPTIONS,
+        "weekdays": WEEKDAYS,
+        "schedule_kind": kind,
+        "backup_time": backup_time,
+        "backup_day": day,
+        **backup_status(state),
+    }
 
 
 def register(app):
@@ -164,45 +192,31 @@ def register(app):
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
-        state = settings.read()
-        admin = state["admin"]
-        error = None
-        status = 200
+        admin = settings.read()["admin"]
         if request.method == "POST":
             if not allow_attempt():
-                return render_template("login.html", setup=not admin, error="Try again in five minutes."), 429
+                return render_template("login.html", error="Try again in five minutes."), 429
             username = request.form.get("username", "")
             password = request.form.get("password", "")
-            if admin:
-                if len(password) <= 256 and check_password_hash(admin["hash"], password) and same_text(username, admin["username"]):
-                    start_session(admin)
-                    with attempt_lock:
-                        attempts.pop(request.remote_addr, None)
-                    return redirect(url_for("dashboard"))
-                error, status = "Incorrect username or password.", 401
-            else:
-                token = request.form.get("setup_token", "")
-                if not same_text(token, state["setup_token"]):
-                    error, status = "Incorrect setup token.", 401
-                else:
-                    try:
-                        username = username.strip()
-                        if not settings.valid_username(username):
-                            raise ValueError("Enter a valid administrator name.")
-                        admin = {"username": username, "hash": generate_password_hash(new_password())}
-                        with settings.edit() as current:
-                            if current["admin"]:
-                                return redirect(url_for("login"))
-                            current["admin"], current["setup_token"] = admin, None
-                        start_session(admin)
-                        with attempt_lock:
-                            attempts.pop(request.remote_addr, None)
-                        return redirect(url_for("manage"))
-                    except ValueError as exc:
-                        error, status = str(exc), 400
-        elif admin and session.get("admin") == admin_marker(admin):
+            if len(password) <= 256 and check_password_hash(admin["hash"], password) and same_text(username, admin["username"]):
+                if not admin.get("sync_enabled"):
+                    # The old dashboard hash cannot be used by Anki. Link it
+                    # using the plaintext from this successful login.
+                    with settings.edit() as state:
+                        current = state["admin"]
+                        if current["hash"] != admin["hash"]:
+                            return redirect(url_for("login"))
+                        if not current.get("sync_enabled"):
+                            settings.set_admin_sync_password(state, password)
+                        admin = current
+                start_session(admin)
+                with attempt_lock:
+                    attempts.pop(request.remote_addr, None)
+                return redirect(url_for("dashboard"))
+            return render_template("login.html", error="Incorrect username or password."), 401
+        if session.get("admin") == admin_marker(admin):
             return redirect(url_for("dashboard"))
-        return render_template("login.html", setup=not state["admin"], error=error), status
+        return render_template("login.html")
 
     @app.post("/logout")
     def logout():
@@ -211,52 +225,47 @@ def register(app):
 
     @app.route("/settings", methods=["GET", "POST"])
     def manage():
-        if request.method == "POST":
-            action = request.form.get("action")
-            try:
-                if action == "options":
-                    save_options(request.form)
-                    flash("Settings saved.", "ok")
-                elif action == "admin":
-                    with settings.edit() as state:
-                        admin = state["admin"]
-                        if not check_password_hash(admin["hash"], request.form.get("current_password", "")):
-                            raise ValueError("The current administrator password is incorrect.")
-                        admin["hash"] = generate_password_hash(new_password())
-                    start_session(admin)
-                    flash("Administrator password updated.", "ok")
-                elif action in {"add", "reset", "remove"}:
-                    username = request.form.get("username", "")
-                    if action == "add" and not settings.valid_username(username):
-                        raise ValueError("Use letters, numbers, spaces or the characters _ @ . + - for the username.")
-                    password = settings.password_hash(new_password()) if action != "remove" else None
-                    with settings.edit() as state:
-                        users = state["users"]
-                        if action == "add" and username in users:
-                            raise ValueError("That sync username already exists.")
-                        if action != "add" and username not in users:
-                            raise ValueError("That sync username no longer exists.")
-                        if action == "remove":
-                            del users[username]
-                        else:
-                            users[username] = password
-                    flash("Sync users updated. The sync service applies the change in a few seconds.", "ok")
-                else:
-                    abort(400)
-            except ValueError as exc:
-                flash(str(exc), "error")
-            return redirect(url_for("manage"))
+        if request.method != "POST":
+            return redirect(url_for("dashboard", tab="users"))
 
-        state = settings.read()
-        options = state["options"]
-        last_backup = state["last_backup"]
-        zone = options["BACKUP_TIMEZONE"]
-        kind, backup_time, day = schedule_view(options["BACKUP_SCHEDULE"])
-        return render_template(
-            "settings.html", users=sorted(state["users"]), options=options,
-            fields=settings.OPTIONS, choices=settings.CHOICES, weekdays=WEEKDAYS,
-            schedule_kind=kind, backup_time=backup_time, backup_day=day,
-            next_run=display_time(state["next_backup"], zone),
-            last_run=display_time(last_backup["time"], zone) if last_backup else None,
-            last_ok=last_backup and last_backup["success"], pending=state["backup_job"],
-        )
+        action = request.form.get("action")
+        tab = "backups" if action == "options" else "users"
+        show_add = None
+        try:
+            if action == "options":
+                save_options(request.form)
+                flash("Backup schedule saved.", "ok")
+            elif action == "admin":
+                with settings.edit() as state:
+                    admin = state["admin"]
+                    if not check_password_hash(admin["hash"], request.form.get("current_password", "")):
+                        raise ValueError("The current administrator password is incorrect.")
+                    password = new_password()
+                    admin["hash"] = generate_password_hash(password)
+                    settings.set_admin_sync_password(state, password)
+                start_session(admin)
+                flash("Administrator password updated.", "ok")
+            elif action in {"add", "reset", "remove"}:
+                username = request.form.get("username", "")
+                if action == "add" and not settings.valid_username(username):
+                    raise ValueError("Use letters, numbers, spaces or the characters _ @ . + - for the username.")
+                password = settings.password_hash(new_password()) if action != "remove" else None
+                with settings.edit() as state:
+                    if username == state["admin"]["username"]:
+                        raise ValueError("Use Edit on the administrator account to change its password.")
+                    users = state["users"]
+                    if action == "add" and username in users:
+                        raise ValueError("That sync username already exists.")
+                    if action != "add" and username not in users:
+                        raise ValueError("That sync username no longer exists.")
+                    if action == "remove":
+                        del users[username]
+                    else:
+                        users[username] = password
+                flash("Sync users updated. The sync service applies the change in a few seconds.", "ok")
+            else:
+                abort(400)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            show_add = "1" if action == "add" else None
+        return redirect(url_for("dashboard", tab=tab, add=show_add), code=303)
