@@ -1,0 +1,7 @@
+target/
+*.log
+.env
+dashboard_test.py
+.env.*
+__pycache__/
+*.py[cod]

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}{% endblock %} · Anki Sync Server</title>
+    <style>
+        :root { color-scheme: dark; font-family: system-ui, sans-serif; color: #e2e8f0; background: #0f172a; }
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 1.25rem; }
+        main { max-width: 64rem; margin: 1.5rem auto; }
+        h1, h2, h3 { margin-top: 0; }
+        p { line-height: 1.55; }
+        a { color: #67e8f9; }
+        button, input, select { font: inherit; }
+        button, input, select { padding: .65rem .8rem; border-radius: .4rem; border: 1px solid #475569; }
+        input:not([type="checkbox"]), select { width: 100%; color: inherit; background: #0f172a; }
+        input[type="checkbox"] { margin-right: .4rem; }
+        button { background: #155e75; color: white; cursor: pointer; }
+        button:hover { background: #0e7490; }
+        button.danger { background: #881337; }
+        section, .panel { margin: 1rem 0; padding: 1.25rem; border-radius: .8rem; background: #1e293b; }
+        label { display: block; margin: .65rem 0; }
+        label input:not([type="checkbox"]), label select { margin-top: .3rem; }
+        .muted, small { color: #b2bfd0; }
+        .message { border-left: .25rem solid #2dd4bf; padding: .65rem; background: #142d38; }
+        .error { border-color: #fb7185; background: #3a2335; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: 0 1rem; }
+        .header, .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+        .header { justify-content: space-between; }
+        fieldset { border: 1px solid #475569; border-radius: .5rem; margin: 1rem 0; padding: .7rem 1rem; }
+        legend { font-weight: 600; }
+        details { border-top: 1px solid #475569; padding: .65rem 0; }
+        summary { cursor: pointer; overflow-wrap: anywhere; }
+        .signin { max-width: 30rem; margin: 8vh auto; }
+    </style>
+</head>
+<body>
+<main class="{% block main_class %}{% endblock %}">
+    {% block content %}{% endblock %}
+</main>
+</body>
+</html>

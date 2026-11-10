@@ -1,0 +1,62 @@
+# =============================================================================
+# Anki Sync Server Enhanced - Comprehensive Docker Image
+# =============================================================================
+# Matches the toolchain Anki pins in rust-toolchain.toml
+FROM rust:1.92-slim AS builder
+RUN apt-get update && apt-get install -y \
+    git \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+ARG ANKI_VERSION=26.05
+RUN printf '%s\n' "$ANKI_VERSION" > /anki_version.txt \
+    && cargo install --locked --git https://github.com/ankitects/anki.git \
+       --tag "$ANKI_VERSION" anki-sync-server
+
+# Final image - Debian for glibc compatibility
+FROM debian:bookworm-slim
+
+# All services and the backup scheduler run in this image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget curl bash tzdata sqlite3 openssl caddy \
+    jq netcat-openbsd python3 python3-pip procps pigz \
+    fail2ban iptables util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages --no-cache-dir \
+    'Flask>=3.1,<4' 'croniter>=6,<7' boto3 waitress
+
+# Vendored dashboard JS, no CDN at runtime
+RUN mkdir -p /usr/local/share/anki-dashboard \
+    && curl -fsSL -o /usr/local/share/anki-dashboard/chart.umd.js https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.js \
+    && curl -fsSL -o /usr/local/share/anki-dashboard/tailwind.js https://cdn.tailwindcss.com/3.4.16
+
+# Create user and directories
+RUN useradd -m -s /bin/bash -u 1000 anki \
+    && mkdir -p /var/log/anki /var/lib/anki /data /backups /config /config/caddy \
+    && touch /var/log/anki/sync.log /var/log/anki/auth.log /var/log/anki/backup.log /var/log/anki/server.log \
+    && chown -R anki:anki /var/log/anki /var/lib/anki /data /backups /config /home/anki
+
+# Copy binary and version info
+COPY --from=builder /usr/local/cargo/bin/anki-sync-server /usr/local/bin/
+COPY --from=builder /anki_version.txt /anki_version.txt
+
+# Copy all scripts
+COPY scripts/ /usr/local/bin/
+COPY entrypoint.sh /usr/local/bin/
+COPY healthcheck.sh /usr/local/bin/
+COPY backup.sh /usr/local/bin/
+COPY fail2ban/ /etc/fail2ban/
+RUN rm -f /etc/fail2ban/jail.d/defaults-debian.conf
+RUN chmod +x /usr/local/bin/*.sh /usr/local/bin/*.py 2>/dev/null || true
+
+# Expose ports: HTTP, HTTPS, Metrics, Dashboard
+EXPOSE 8080 8443 9090 8081
+
+VOLUME ["/data", "/backups", "/config"]
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD /usr/local/bin/healthcheck.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
